@@ -3,7 +3,7 @@
 """Widesight massive uploader.
 
 Usage:
-  ws_uploader.py process FOLDER_PATH --gpx=PATH [--telemetry=PATH --delay=MILLISECONDS]
+  ws_uploader.py process FOLDER_PATH --gpx=PATH [--csv=PATH --telemetry=PATH --delay=MILLISECONDS]
   ws_uploader.py upload FOLDER_PATH (--new_sequence=TITLE | --sequence=ID) --user=USER --password=PASSWORD --backend=URL [--height=H]
   ws_uploader.py -h | --help
   ws_uploader.py --version
@@ -20,6 +20,7 @@ Options:
   --sequence=ID            Sequence container
   --height=H               Height from ground of camera [default: 2]
   --gpx=PATH               Gpx file path
+  --csv=PATH               CSV witn frames instant time
   --telemetry=PATH         Telemetry csv path
   --delay=MILLISECONDS     Delay adjust in milliseconds [default: 0]
 
@@ -38,6 +39,8 @@ import csv
 
 from docopt import docopt
 
+TDH = 0 #timedelta correction ???
+
 if __name__ == '__main__':
     arguments = docopt(__doc__, version='Widesight massive uploader 1.0')
     print(arguments)
@@ -45,6 +48,7 @@ if __name__ == '__main__':
 if arguments['process']:
     TELEMETRY_FILE = arguments['--telemetry']
     GPX_FILE = arguments['--gpx']
+    CSV_FILE = arguments['--csv']
     IMAGES_FOLDER = arguments['FOLDER_PATH']
     MS_DELAY_ADJUST=-650
 
@@ -85,7 +89,25 @@ if arguments['process']:
         compass_bearing = (initial_bearing + 360) % 360
 
         return compass_bearing
+    
+    def get_exif_dict(img_file):
+        img = Image.open(img_file)
+        try:
+            exif_dict = piexif.load(img.info['exif'])
+        except:
+            exif_dict = {
+                "Exif":{},
+                "GPS":{}
+            }
+        return exif_dict
 
+    def set_time_tags(img_file,dt):
+        exif_dict = get_exif_dict(img_file)
+        exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = dt.strftime("%Y:%m:%d %H:%M:%S")
+        exif_dict['Exif'][piexif.ExifIFD.SubSecTimeOriginal] = dt.strftime("%f")
+        exif_bytes = piexif.dump(exif_dict)
+        piexif.insert(exif_bytes, img_file)
+        
     def set_gps_tags(img_file,mods):
 
         def to_deg(value, loc):
@@ -122,9 +144,9 @@ if arguments['process']:
         if not mods:
             print (img_file + " fuori intervallo", mods)
             return
-        img = Image.open(img_file)
-        exif_dict = piexif.load(img.info['exif'])
-
+        
+        exif_dict = get_exif_dict(img_file)
+        
         lat_deg = to_deg( mods["lat"], ["S", "N"])
         lng_deg = to_deg( mods["lon"], ["W", "E"])
 
@@ -148,7 +170,7 @@ if arguments['process']:
 
         print (exif_dict['GPS'])
         exif_bytes = piexif.dump(exif_dict)
-        img.save(img_file, "jpeg", exif=exif_bytes)
+        piexif.insert(exif_bytes, img_file)
 
     class telemetry_seq:
         points = []
@@ -163,12 +185,13 @@ if arguments['process']:
         def interpolate_point(self,time_sample):
             found = None
             for i, point in enumerate(self.points):
-                if point.time > time_sample - timedelta(hours=1):
+                #print (point.time, time_sample)
+                if point.time.replace(tzinfo=None) > time_sample.replace(tzinfo=None) - timedelta(hours=TDH):
                     found = True
                     break
             if found:
                 segment_delta = self.points[i].time - self.points[i-1].time
-                interpolation_delta = (time_sample - timedelta(hours=1)) - self.points[i-1].time
+                interpolation_delta = (time_sample.replace(tzinfo=None) - timedelta(hours=TDH)) - self.points[i-1].time.replace(tzinfo=None)
                 interpolation_factor = interpolation_delta.total_seconds() / segment_delta.total_seconds()
                 delta_lat = self.points[i].latitude - self.points[i-1].latitude
                 delta_lon = self.points[i].longitude - self.points[i-1].longitude
@@ -178,8 +201,6 @@ if arguments['process']:
                 new_alt = self.points[i-1].elevation + delta_alt * interpolation_factor
                 unix_delta = (time_sample - timedelta(hours=1)) - datetime.utcfromtimestamp(0)
                 roll_pitch = self.interpolate_measure(unix_delta.total_seconds())
-                #print ("INTERPOLATION: ",segment_delta, interpolation_delta.total_seconds(), interpolation_factor, unix_delta)
-                #print(roll_pitch)
                 heading = calculate_initial_compass_bearing((self.points[i-1].latitude,self.points[i-1].longitude),(self.points[i].latitude,self.points[i].longitude),)
                 return {
                     "lat": new_lat,
@@ -237,6 +258,14 @@ if arguments['process']:
 
     print (dir(point))
     files_list = os.listdir(IMAGES_FOLDER)
+    #load csv
+    if CSV_FILE:
+        with open(CSV_FILE) as csvf:
+            csv_reader = csv.DictReader(csvf, delimiter=',')
+            frames_time = [row["utc"] for row in csv_reader]
+    else:
+        frames_time = []
+    print (frames_time)
     for image_file in sorted(files_list):
         f, file_extension = os.path.splitext(image_file)
         if file_extension.upper() in ('.JPG','.JPEG'):
@@ -244,12 +273,18 @@ if arguments['process']:
             image = open(image_path, 'rb')
             tags = exifread.process_file(image)
             image.close()
-            image_shottime = datetime.strptime(str(tags['EXIF DateTimeOriginal'])+','+str(tags['EXIF SubSecTimeOriginal']), '%Y:%m:%d  %H:%M:%S,%f')
+            try:
+                image_shottime = datetime.strptime(str(tags['EXIF DateTimeOriginal'])+','+str(tags['EXIF SubSecTimeOriginal']), '%Y:%m:%d  %H:%M:%S,%f')
+            except:
+                #image_shottime = datetime.fromtimestamp(os.path.getmtime(image_path))
+                if frames_time:
+                    print (int(f.split("_")[-1]), frames_time[int(f.split("_")[-1])][:-4])
+                    image_shottime = datetime.strptime(frames_time[int(f.split("_")[-1])][:-4], '%Y-%m-%d %H:%M:%S.%f') #2023-07-26 14:53:27.519276508
+                else:
+                    image_shottime = datetime.strptime(f.split("_")[2], '%Y%m%d-%H%M%S')
             image_shottime = image_shottime + timedelta(milliseconds=MS_DELAY_ADJUST)
-            print ("image_shottime ",image_shottime)
+            set_time_tags(image_path, image_shottime)
             set_gps_tags(image_path, seq_telemetry.interpolate_point(image_shottime))
-            print (str(tags['EXIF DateTimeOriginal'])+','+str(tags['EXIF SubSecTimeOriginal']))
-            #print (image_file, image_shottime, str(tags['EXIF DateTimeOriginal'])+','+str(tags['EXIF SubSecTimeOriginal']))
 
 if arguments['upload']:
 
